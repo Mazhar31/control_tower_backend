@@ -9,7 +9,7 @@ LEASH_URL = os.getenv(
     "LEASH_URL",
     "https://kvyoe6hbjzq4xfdzcntu5qxxb40jtgiw.lambda-url.us-east-2.on.aws/",
 )
-LEASH_TIMEOUT = float(os.getenv("LEASH_TIMEOUT", "420"))
+LEASH_TIMEOUT = float(os.getenv("LEASH_TIMEOUT", "900"))
 LEASH_API_KEY = os.getenv("LEASH_API_KEY", "")
 
 logger.info("[LEASH] API key loaded: %s", LEASH_API_KEY[:8] + "..." if LEASH_API_KEY else "NOT SET")

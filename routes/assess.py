@@ -103,8 +103,8 @@ async def submit_assessment(
     systemDescription: str = Form(...),
     industry: str = Form(...),
     geography: str = Form(...),
-    usStates: str = Form(""),           # comma-separated
-    selectedFrameworks: str = Form(...),  # comma-separated
+    usStates: str = Form(""),
+    selectedFrameworks: str = Form(""),  # ignored — hardcoded below
     aihcsResponse: str = Form(...),
     deploymentStage: str = Form(...),
     dataTypes: str = Form(""),
@@ -166,7 +166,7 @@ async def submit_assessment(
                 result.get("session_id"), result.get("risk_tier"),
                 len(result.get("gap_findings", [])))
         except httpx.TimeoutException:
-            logger.error("[LEASH] Timed out after %ss", 420)
+            logger.error("[LEASH] Timed out after %ss", 900)
             raise HTTPException(status_code=504, detail="Assessment timed out. Please try again.")
         except Exception as e:
             logger.error("[LEASH] Failed: %s", str(e))
