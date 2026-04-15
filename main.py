@@ -39,7 +39,7 @@ app = FastAPI(title="TAIGA Compliance API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*", "https://control-tower-frontend.onrender.com"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
