@@ -1,7 +1,7 @@
 import json
 import os
-import shutil
 import logging
+import io
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
 from typing import Optional, List
@@ -105,29 +105,49 @@ async def submit_assessment(
     geography: str = Form(...),
     usStates: str = Form(""),
     selectedFrameworks: str = Form(""),  # ignored — hardcoded below
+    aiType: str = Form(""),
+    decisionImpact: str = Form(""),
+    existingDocs: str = Form(""),
     aihcsResponse: str = Form(...),
     deploymentStage: str = Form(...),
     dataTypes: str = Form(""),
     additionalContext: str = Form(""),
-    file: Optional[UploadFile] = File(None),
+    files: List[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
 ):
     user_id = int(user["sub"])
 
-    # Handle optional file upload
-    uploaded_file_name = None
-    uploaded_file_path = None
-    if file and file.filename:
-        ext = os.path.splitext(file.filename)[1].lower()
+    # Handle optional file uploads
+    uploaded_file_names = []
+    all_file_texts = []
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    for upload in files:
+        if not upload.filename:
+            continue
+        ext = os.path.splitext(upload.filename)[1].lower()
         if ext not in ALLOWED_EXTS:
-            raise HTTPException(status_code=400, detail="Only PDF and DOCX files are accepted")
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
-        dest = os.path.join(UPLOAD_DIR, f"user{user_id}_{file.filename}")
+            raise HTTPException(status_code=400, detail=f"{upload.filename}: only PDF and DOCX files are accepted")
+        file_bytes = await upload.read()
+        dest = os.path.join(UPLOAD_DIR, f"user{user_id}_{upload.filename}")
         with open(dest, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-        uploaded_file_name = file.filename
-        uploaded_file_path = dest
+            f.write(file_bytes)
+        uploaded_file_names.append(upload.filename)
+        try:
+            if ext == ".pdf":
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(file_bytes))
+                text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            elif ext == ".docx":
+                from docx import Document
+                doc = Document(io.BytesIO(file_bytes))
+                text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            else:
+                text = ""
+            if text:
+                all_file_texts.append(f"--- Document: {upload.filename} ---\n{text[:8000]}")
+        except Exception as e:
+            logger.warning("[FILE] Could not extract text from %s: %s", upload.filename, e)
 
     # Build intake payload
     intake_data = {
@@ -138,10 +158,13 @@ async def submit_assessment(
         "geography": geography,
         "usStates": [s.strip() for s in usStates.split(",") if s.strip()],
         "selectedFrameworks": ["EU AI Act", "ISO 42001", "HIPAA", "NIST AI RMF"],
+        "aiType": aiType,
+        "decisionImpact": decisionImpact,
+        "existingDocs": [d.strip() for d in existingDocs.split(",") if d.strip()],
         "aihcsResponse": aihcsResponse,
         "deploymentStage": deploymentStage,
         "dataTypes": dataTypes,
-        "additionalContext": additionalContext,
+        "additionalContext": (additionalContext + ("\n\n" + "\n\n".join(all_file_texts)) if all_file_texts else additionalContext).strip(),
     }
 
     # Call The Leash (or mock)
@@ -181,8 +204,8 @@ async def submit_assessment(
         assessment_date=result.get("assessment_date"),
         risk_tier=result.get("risk_tier"),
         response_json=json.dumps(result),
-        uploaded_file_name=uploaded_file_name,
-        uploaded_file_path=uploaded_file_path,
+        uploaded_file_name=json.dumps(uploaded_file_names) if uploaded_file_names else None,
+        uploaded_file_path=None,
     )
     db.add(assessment)
     db.commit()

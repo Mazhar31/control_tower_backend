@@ -7,3 +7,5 @@ python-multipart
 pydantic[email]
 httpx
 python-dotenv
+pypdf
+python-docx
