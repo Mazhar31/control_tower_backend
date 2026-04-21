@@ -101,17 +101,24 @@ async def submit_assessment(
     companyName: str = Form(...),
     systemName: str = Form(...),
     systemDescription: str = Form(...),
-    industry: str = Form(...),
-    geography: str = Form(...),
+    aihcsResponse: str = Form(...),
+    geography: str = Form(""),
     usStates: str = Form(""),
-    selectedFrameworks: str = Form(""),  # ignored — hardcoded below
+    industry: str = Form(""),
+    sectorRegs: str = Form(""),
+    selectedFrameworks: str = Form(""),
     aiType: str = Form(""),
     decisionImpact: str = Form(""),
     existingDocs: str = Form(""),
-    aihcsResponse: str = Form(...),
-    deploymentStage: str = Form(...),
     dataTypes: str = Form(""),
+    infrastructure: str = Form(""),
+    scaleEstimate: str = Form(""),
+    aihcsDetail: str = Form(""),
+    deploymentStage: str = Form("production"),
     additionalContext: str = Form(""),
+    contactName: str = Form(""),
+    contactTitle: str = Form(""),
+    contactEmail: str = Form(""),
     files: List[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
@@ -149,7 +156,9 @@ async def submit_assessment(
         except Exception as e:
             logger.warning("[FILE] Could not extract text from %s: %s", upload.filename, e)
 
-    # Build intake payload
+    # Build intake payload exactly matching Leash API spec
+    full_additional_context = (additionalContext + ("\n\n" + "\n\n".join(all_file_texts)) if all_file_texts else additionalContext).strip()
+
     intake_data = {
         "companyName": companyName,
         "systemName": systemName,
@@ -158,13 +167,10 @@ async def submit_assessment(
         "geography": geography,
         "usStates": [s.strip() for s in usStates.split(",") if s.strip()],
         "selectedFrameworks": ["EU AI Act", "ISO 42001", "HIPAA", "NIST AI RMF"],
-        "aiType": aiType,
-        "decisionImpact": decisionImpact,
-        "existingDocs": [d.strip() for d in existingDocs.split(",") if d.strip()],
         "aihcsResponse": aihcsResponse,
-        "deploymentStage": deploymentStage,
+        "deploymentStage": deploymentStage if deploymentStage else "production",
         "dataTypes": dataTypes,
-        "additionalContext": (additionalContext + ("\n\n" + "\n\n".join(all_file_texts)) if all_file_texts else additionalContext).strip(),
+        "additionalContext": full_additional_context,
     }
 
     # Call The Leash (or mock)
@@ -194,6 +200,24 @@ async def submit_assessment(
         except Exception as e:
             logger.error("[LEASH] Failed: %s", str(e))
             raise HTTPException(status_code=502, detail=f"Assessment service error: {str(e)}")
+
+    # Calculate prior score from user's last assessment for trend
+    prior = (
+        db.query(Assessment)
+        .filter(Assessment.user_id == user_id)
+        .order_by(Assessment.id.desc())
+        .first()
+    )
+    if prior and prior.response_json:
+        try:
+            prior_result = json.loads(prior.response_json)
+            prior_coverage = prior_result.get("framework_coverage", {})
+            vals = [v["pct_compliant"] for v in prior_coverage.values() if isinstance(v.get("pct_compliant"), (int, float))]
+            result["prior_score"] = round(sum(vals) / len(vals)) if vals else None
+        except Exception:
+            result["prior_score"] = None
+    else:
+        result["prior_score"] = None
 
     # Persist to DB
     assessment = Assessment(
