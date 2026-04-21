@@ -9,7 +9,7 @@ from database import get_db
 from models import Assessment
 from schemas import AssessmentSummary
 from routes.deps import get_current_user
-from leash_service import run_assessment
+from leash_service import run_assessment, start_assessment, continue_assessment, finish_assessment
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -240,6 +240,217 @@ async def submit_assessment(
     db.refresh(assessment)
 
     return {"assessment_id": assessment.id, "result": result}
+
+
+def _build_prior_score(db, user_id):
+    prior = (
+        db.query(Assessment)
+        .filter(Assessment.user_id == user_id)
+        .order_by(Assessment.id.desc())
+        .first()
+    )
+    if prior and prior.response_json:
+        try:
+            prior_coverage = json.loads(prior.response_json).get("framework_coverage", {})
+            vals = [v["pct_compliant"] for v in prior_coverage.values() if isinstance(v.get("pct_compliant"), (int, float))]
+            return round(sum(vals) / len(vals)) if vals else None
+        except Exception:
+            return None
+    return None
+
+
+def _save_assessment(db, user_id, result, uploaded_file_names, nextAuditDate):
+    result["prior_score"] = _build_prior_score(db, user_id)
+    if nextAuditDate:
+        result["next_audit_date"] = nextAuditDate
+    assessment = Assessment(
+        user_id=user_id,
+        session_id=result.get("session_id"),
+        company_name=result.get("company_name"),
+        system_name=result.get("system_name"),
+        assessment_date=result.get("assessment_date"),
+        risk_tier=result.get("risk_tier"),
+        response_json=json.dumps(result),
+        uploaded_file_name=json.dumps(uploaded_file_names) if uploaded_file_names else None,
+        uploaded_file_path=None,
+    )
+    db.add(assessment)
+    db.commit()
+    db.refresh(assessment)
+    return assessment
+
+
+@router.post("/start")
+async def start_assessment_route(
+    companyName: str = Form(...),
+    systemName: str = Form(...),
+    systemDescription: str = Form(...),
+    aihcsResponse: str = Form(...),
+    geography: str = Form(""),
+    usStates: str = Form(""),
+    industry: str = Form(""),
+    sectorRegs: str = Form(""),
+    selectedFrameworks: str = Form(""),
+    aiType: str = Form(""),
+    decisionImpact: str = Form(""),
+    existingDocs: str = Form(""),
+    dataTypes: str = Form(""),
+    infrastructure: str = Form(""),
+    scaleEstimate: str = Form(""),
+    aihcsDetail: str = Form(""),
+    deploymentStage: str = Form("production"),
+    additionalContext: str = Form(""),
+    contactName: str = Form(""),
+    contactTitle: str = Form(""),
+    contactEmail: str = Form(""),
+    nextAuditDate: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Phase 1: submit intake, get back questions or go straight to result."""
+    user_id = int(user["sub"])
+
+    uploaded_file_names = []
+    all_file_texts = []
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    for upload in files:
+        if not upload.filename:
+            continue
+        ext = os.path.splitext(upload.filename)[1].lower()
+        if ext not in ALLOWED_EXTS:
+            raise HTTPException(status_code=400, detail=f"{upload.filename}: only PDF and DOCX files are accepted")
+        file_bytes = await upload.read()
+        with open(os.path.join(UPLOAD_DIR, f"user{user_id}_{upload.filename}"), "wb") as f:
+            f.write(file_bytes)
+        uploaded_file_names.append(upload.filename)
+        try:
+            if ext == ".pdf":
+                from pypdf import PdfReader
+                text = "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(file_bytes)).pages)
+            elif ext == ".docx":
+                from docx import Document
+                text = "\n".join(p.text for p in Document(io.BytesIO(file_bytes)).paragraphs if p.text.strip())
+            else:
+                text = ""
+            if text:
+                all_file_texts.append(f"--- Document: {upload.filename} ---\n{text[:8000]}")
+        except Exception as e:
+            logger.warning("[FILE] Could not extract text from %s: %s", upload.filename, e)
+
+    full_additional_context = (additionalContext + ("\n\n" + "\n\n".join(all_file_texts)) if all_file_texts else additionalContext).strip()
+
+    intake_data = {
+        "companyName": companyName,
+        "systemName": systemName,
+        "systemDescription": systemDescription,
+        "industry": industry,
+        "geography": geography,
+        "usStates": [s.strip() for s in usStates.split(",") if s.strip()],
+        "selectedFrameworks": ["EU AI Act", "ISO 42001", "HIPAA", "NIST AI RMF"],
+        "aihcsResponse": aihcsResponse,
+        "deploymentStage": deploymentStage if deploymentStage else "production",
+        "dataTypes": dataTypes,
+        "additionalContext": full_additional_context,
+    }
+
+    if USE_MOCK:
+        # Mock: skip questions, return final result directly
+        result = MOCK_RESPONSE
+        assessment = _save_assessment(db, user_id, result, uploaded_file_names, nextAuditDate)
+        return {"status": "complete", "assessment_id": assessment.id, "result": result}
+
+    try:
+        leash_result = await start_assessment(intake_data)
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Assessment timed out. Please try again.")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Assessment service error: {str(e)}")
+
+    if leash_result.get("action_required") == "answer_questions":
+        # Return questions to the frontend — session_id needed for /continue
+        return {
+            "status": "questions",
+            "session_id": leash_result["session_id"],
+            "questions": leash_result.get("questions", []),
+            "round": leash_result.get("round", 1),
+            "_meta": {"uploaded_file_names": uploaded_file_names, "nextAuditDate": nextAuditDate},
+        }
+
+    # No questions — run audit+generate immediately
+    try:
+        raw = await finish_assessment(leash_result["session_id"])
+        taiga_token = raw.get("taiga_token", {})
+        result = {
+            **taiga_token,
+            "report_url": raw.get("report_url", ""),
+            "report_s3_key": raw.get("report_s3_key", ""),
+            "total_findings": raw.get("total_findings", len(taiga_token.get("gap_findings", []))),
+            "audit_summary": raw.get("audit_summary", {}),
+        }
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Assessment timed out. Please try again.")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Assessment service error: {str(e)}")
+
+    assessment = _save_assessment(db, user_id, result, uploaded_file_names, nextAuditDate)
+    return {"status": "complete", "assessment_id": assessment.id, "result": result}
+
+
+@router.post("/continue")
+async def continue_assessment_route(
+    session_id: str = Form(...),
+    answers: str = Form(...),          # JSON string: [{question_index, answer}, ...]
+    uploaded_file_names: str = Form(""),  # JSON string
+    nextAuditDate: str = Form(""),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Phase 2: submit answers, get back more questions or final result."""
+    user_id = int(user["sub"])
+
+    try:
+        parsed_answers = json.loads(answers)
+        parsed_file_names = json.loads(uploaded_file_names) if uploaded_file_names else []
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid answers format.")
+
+    try:
+        raw = await continue_assessment(session_id, parsed_answers)
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Assessment timed out. Please try again.")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Assessment service error: {str(e)}")
+
+    # Check if more questions needed
+    if raw.get("action_required") == "answer_questions":
+        return {
+            "status": "questions",
+            "session_id": raw["session_id"],
+            "questions": raw.get("questions", []),
+            "round": raw.get("round", 1),
+            "_meta": {"uploaded_file_names": parsed_file_names, "nextAuditDate": nextAuditDate},
+        }
+
+    # No more questions — run audit + generate
+    try:
+        raw = await finish_assessment(raw.get("session_id", session_id))
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Assessment timed out. Please try again.")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Assessment service error: {str(e)}")
+
+    taiga_token = raw.get("taiga_token", {})
+    result = {
+        **taiga_token,
+        "report_url": raw.get("report_url", ""),
+        "report_s3_key": raw.get("report_s3_key", ""),
+        "total_findings": raw.get("total_findings", len(taiga_token.get("gap_findings", []))),
+        "audit_summary": raw.get("audit_summary", {}),
+    }
+
+    assessment = _save_assessment(db, user_id, result, parsed_file_names, nextAuditDate)
+    return {"status": "complete", "assessment_id": assessment.id, "result": result}
 
 
 @router.get("/history")

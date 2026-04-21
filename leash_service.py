@@ -33,6 +33,33 @@ async def _post(client: httpx.AsyncClient, body: dict) -> dict:
     return data
 
 
+async def start_assessment(intake_data: dict) -> dict:
+    """Call start, return questions if triage needed, else run full assessment."""
+    async with httpx.AsyncClient(timeout=LEASH_TIMEOUT) as client:
+        result = await _post(client, {"action": "start", **intake_data})
+        return result
+
+
+async def continue_assessment(session_id: str, answers: list) -> dict:
+    """Submit one round of answers and return the raw Leash response (questions or proceed)."""
+    async with httpx.AsyncClient(timeout=LEASH_TIMEOUT) as client:
+        result = await _post(client, {
+            "action": "answer",
+            "session_id": session_id,
+            "answers": answers,
+        })
+        return result
+
+
+async def finish_assessment(session_id: str) -> dict:
+    """Run audit + generate after all question rounds are done."""
+    async with httpx.AsyncClient(timeout=LEASH_TIMEOUT) as client:
+        result = await _post(client, {"action": "audit", "session_id": session_id})
+        session_id = result.get("session_id", session_id)
+        result = await _post(client, {"action": "generate", "session_id": session_id})
+        return result
+
+
 async def run_assessment(intake_data: dict) -> dict:
     async with httpx.AsyncClient(timeout=LEASH_TIMEOUT) as client:
         session_id = None
