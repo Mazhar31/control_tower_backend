@@ -119,6 +119,7 @@ async def submit_assessment(
     contactName: str = Form(""),
     contactTitle: str = Form(""),
     contactEmail: str = Form(""),
+    nextAuditDate: str = Form(""),
     files: List[UploadFile] = File(default=[]),
     db: Session = Depends(get_db),
     user=Depends(get_current_user),
@@ -218,6 +219,9 @@ async def submit_assessment(
             result["prior_score"] = None
     else:
         result["prior_score"] = None
+
+    if nextAuditDate:
+        result["next_audit_date"] = nextAuditDate
 
     # Persist to DB
     assessment = Assessment(

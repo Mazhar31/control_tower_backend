@@ -1,7 +1,8 @@
+import json
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User
+from models import User, Assessment
 from schemas import AdminCreateUserRequest, AdminUserResponse
 from auth import hash_password
 from routes.deps import get_current_user
@@ -54,3 +55,33 @@ def create_user(
     db.commit()
     db.refresh(user)
     return user
+
+
+@router.get("/assessments")
+def list_assessments(db: Session = Depends(get_db), _: dict = Depends(require_admin)):
+    rows = (
+        db.query(Assessment, User.name, User.email)
+        .join(User, Assessment.user_id == User.id)
+        .order_by(Assessment.id.desc())
+        .all()
+    )
+    result = []
+    for assessment, user_name, user_email in rows:
+        report_url = None
+        if assessment.response_json:
+            try:
+                report_url = json.loads(assessment.response_json).get("report_url")
+            except Exception:
+                pass
+        result.append({
+            "id": assessment.id,
+            "user_name": user_name,
+            "user_email": user_email,
+            "company_name": assessment.company_name,
+            "system_name": assessment.system_name,
+            "assessment_date": assessment.assessment_date,
+            "risk_tier": assessment.risk_tier,
+            "created_at": assessment.created_at.isoformat() if assessment.created_at else None,
+            "report_url": report_url,
+        })
+    return result
